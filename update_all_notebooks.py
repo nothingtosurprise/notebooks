@@ -2222,6 +2222,119 @@ _HF_MODEL_REF_PLACEHOLDER_ORGS = {
 _MODEL_CREATED_CACHE_PATH = os.path.join("scripts", "model_created_at.csv")
 
 
+# Matches `fast_inference = True` (any whitespace around =, any case). This
+# is Unsloth's flag for enabling vLLM during GRPO training, so GRPO notebooks
+# that set it get rendered with a "GRPO + vLLM" type in the README.
+_FAST_INFERENCE_TRUE_RE = re.compile(
+    r"\bfast_inference\s*=\s*True\b"
+)
+
+
+def notebook_uses_fast_inference(notebook_path):
+    """Return True if any code cell contains `fast_inference = True`.
+
+    Returns False on I/O or parse errors.
+    """
+    try:
+        with open(notebook_path, "r", encoding="utf-8") as f:
+            nb = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    for cell in nb.get("cells", []):
+        if cell.get("cell_type") != "code":
+            continue
+        src_list = cell.get("source", [])
+        src = src_list if isinstance(src_list, str) else "".join(src_list)
+        if _FAST_INFERENCE_TRUE_RE.search(src):
+            return True
+    return False
+
+
+def detect_rl_task(notebook_path):
+    """Inspect an RL/GRPO notebook and classify the task it trains on.
+
+    Returns a short human-readable task label, or None if no task could
+    be inferred. Detection uses two passes:
+
+    1. Datasets referenced by `load_dataset("...")` calls in code cells.
+       This catches the generic math GRPO notebooks (GSM8K, DAPO,
+       MathVista) that share the same boilerplate markdown structure.
+    2. Markdown headers and filename keywords for environment-specific
+       notebooks (2048, Wordle, Sudoku, Multi Environment, kernels).
+
+    Dataset detection runs first so a Vision GRPO notebook that happens
+    to mention "sudoku" in a comment still gets the "Vision Math" label.
+    """
+    try:
+        with open(notebook_path, "r", encoding="utf-8") as f:
+            nb = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    datasets = set()
+    markdown_text = []
+    for cell in nb.get("cells", []):
+        ctype = cell.get("cell_type")
+        src_list = cell.get("source", [])
+        src = src_list if isinstance(src_list, str) else "".join(src_list)
+        if ctype == "code":
+            for m in _LOAD_DATASET_RE.finditer(src):
+                datasets.add(m.group("repo").strip())
+        elif ctype == "markdown":
+            markdown_text.append(src.lower())
+
+    # --- Dataset-based classification (most reliable) --------------------
+    # Any MathVista reference marks this as a Vision Math RL notebook.
+    if any("mathvista" in d.lower() for d in datasets):
+        return "Vision Math"
+    # DAPO math / OpenMathReasoning (Unsloth's newer GRPO reasoning recipe)
+    if any("dapo" in d.lower() or "openmathreasoning" in d.lower() for d in datasets):
+        return "DAPO Math"
+    # Classic GSM8K math-word-problem GRPO notebooks
+    if any("gsm8k" in d.lower() for d in datasets):
+        return "GSM8K Math"
+
+    # --- Markdown / filename based classification ------------------------
+    md_joined = "\n".join(markdown_text)
+    basename_lower = os.path.basename(notebook_path).lower()
+
+    if "wordle" in md_joined or "wordle" in basename_lower:
+        return "Wordle"
+    if (
+        "multi-environment" in md_joined
+        or "multi environment" in md_joined
+        or "multi-environment" in basename_lower
+    ):
+        return "Multi Environment"
+    if (
+        "faster kernels" in md_joined
+        or "optimized matrix multiplication" in md_joined
+    ):
+        return "Auto Kernel Creation"
+    if (
+        "2048 game" in md_joined
+        or "play 2048" in md_joined
+        or "2048" in basename_lower
+    ):
+        return "2048 Game"
+    if "sudoku" in md_joined or "sudoku" in basename_lower:
+        return "Sudoku"
+    return None
+
+
+# Matches `load_dataset("...")` and `load_dataset('...')` with a single
+# positional repo id. Used by detect_rl_task to pull the training dataset
+# out of each notebook's code cells.
+_LOAD_DATASET_RE = re.compile(
+    r"""load_dataset\s*\(\s*
+        (?P<quote>['"])
+        (?P<repo>[^'"]+)
+        (?P=quote)
+    """,
+    re.VERBOSE,
+)
+
+
 def extract_hf_model_refs_from_notebook(notebook_path):
     """Scan a notebook's code cells for <org>/<repo> Hugging Face model refs.
 
@@ -3593,9 +3706,39 @@ def update_readme(
         if on_disk_basename in README_MODEL_NAME_OVERRIDES:
             model_name = README_MODEL_NAME_OVERRIDES[on_disk_basename]
         model_type = info['type'] if info and info['type'] else ""
+        # Classify RL/GRPO notebooks by the task they actually train on
+        # (GSM8K Math, DAPO Math, Vision Math, Wordle, Sudoku, 2048 Game,
+        # Auto Kernel Creation, Multi Environment, ...). This is driven by
+        # the dataset name or markdown headers, not the filename, and
+        # overrides the generic "GRPO" label from the filename classifier.
+        # The "GRPO" prefix is redundant with the section header, so we
+        # drop it entirely when a task is detected.
+        basename_lower_for_rl = os.path.basename(path).lower()
+        # GRPO / RL notebooks: identified by model_type OR filename. Catching
+        # "grpo" in the filename picks up notebooks whose classifier-assigned
+        # type is "Vision GRPO", "FP8 GRPO", etc. (GRPO as a suffix), which
+        # model_type.startswith("GRPO") would miss.
+        is_in_grpo_section = (
+            model_type.startswith("GRPO")
+            or "grpo" in basename_lower_for_rl
+            or "nemo-gym" in basename_lower_for_rl
+            or "nemo_gym" in basename_lower_for_rl
+            or "reinforcement_learning" in basename_lower_for_rl
+        )
+        if is_in_grpo_section:
+            task = detect_rl_task(path)
+            if task:
+                model_type = task
+            elif not model_type:
+                model_type = "GRPO"
+        # Notebooks that enable Unsloth's fast_inference flag are using
+        # vLLM under the hood. Surface that in the Type column so readers
+        # can tell at a glance which variants ship vLLM.
+        if is_in_grpo_section and notebook_uses_fast_inference(path):
+            model_type = (model_type or "GRPO") + " + vLLM"
         architecture = info['architecture'] if info else None
-        size = info['size'] 
-        size = size.replace(r"_", " ") if size else None 
+        size = info['size']
+        size = size.replace(r"_", " ") if size else None
         size = f"**({size})**" if size else ""
 
         requires_a100 = info.get('requires_a100', False)
@@ -3619,7 +3762,11 @@ def update_readme(
             or "-cpt" in basename_lower
             or "_cpt" in basename_lower
         )
-        if model_type == 'GRPO' or is_forced_grpo:
+        # Use the precomputed is_in_grpo_section flag instead of checking
+        # model_type here -- by this point the RL classifier may have
+        # already renamed model_type to "GSM8K Math", "Wordle", etc. which
+        # would no longer start with "GRPO".
+        if is_in_grpo_section or is_forced_grpo:
             section_name = 'GRPO & Reinforcement Learning'
         elif is_text_completion:
             section_name = _TEXT_COMPLETION_SECTION
@@ -3695,26 +3842,79 @@ def update_readme(
         model_prefix = "(A100) " if data.get('requires_a100', False) else ""
         row = f"| **{model_prefix}{data['model']}** {data['size']} | {data['type']} | {data['link']} |\n"
         platform = "Kaggle" if "kaggle" in data['link'].lower() else "Colab"
+        raw_type = data.get("type") or ""
+        # Strip the " + vLLM" suffix to get the base task type for grouping.
+        # Both "GSM8K Math" and "GSM8K Math + vLLM" should group together
+        # when we interleave the GRPO section by task type below.
+        task_type = raw_type.replace(" + vLLM", "").strip() or "Other"
         # Each row carries the precomputed popularity key so that
         # section-level sorting can use it as the primary sort key.
         row_entry = {
             "row": row,
             "popularity_key": data.get("created_at_key", (0, 0)),
+            # Boolean flag -- GRPO + vLLM rows sort to the top of any
+            # section they appear in, regardless of raw popularity.
+            "has_vllm": "vLLM" in raw_type,
+            # Base task type (no " + vLLM" suffix) for the GRPO section
+            # round-robin interleave. Used only by _interleave_by_task.
+            "task_type": task_type,
         }
         for section_name in data["sections"]:
             sections[section_name][platform]["rows"].append(row_entry)
 
     def _section_row_sort_key(entry):
-        # Primary: HF Hub popularity score (downloads + likes*1000) of the
+        # Top bucket: rows whose Type column mentions vLLM (e.g. "GRPO + vLLM")
+        # always sort above non-vLLM rows in the same section. This puts the
+        # vLLM-enabled GRPO notebooks at the top of the GRPO section.
+        # Secondary: HF Hub popularity score (downloads + likes*1000) of the
         # model the notebook actually loads. Notebooks with no resolvable
         # model get 0 which sorts below every real score in a descending
         # sort.
-        # Secondary: count of ok-status refs that contributed to the score.
-        # Tertiary: the version-from-name fallback so Gemma 4 > Gemma 3
-        # when popularity ties (e.g. brand-new releases with 0 downloads).
-        # Quaternary: the row string itself for stable ordering.
+        # Tertiary: count of ok-status refs that contributed to the score.
+        # Quaternary: version-from-name fallback so Gemma 4 > Gemma 3 when
+        # popularity ties (e.g. brand-new releases with 0 downloads).
+        # Quinary: the row string itself for stable ordering.
         popularity, count_ok = entry["popularity_key"]
-        return (popularity, count_ok, extract_version_from_row(entry["row"]), entry["row"])
+        return (
+            1 if entry.get("has_vllm") else 0,
+            popularity,
+            count_ok,
+            extract_version_from_row(entry["row"]),
+            entry["row"],
+        )
+
+    def _interleave_by_task(entries):
+        """Round-robin a list of row entries so adjacent rows show different
+        task types.
+
+        Preserves the vLLM-at-top invariant by partitioning the list into a
+        vLLM bucket and a non-vLLM bucket, interleaving each bucket
+        independently, then concatenating them.
+
+        Within each bucket: group entries by task_type, keeping each group
+        in its incoming (popularity-sorted) order. Order the groups by the
+        popularity of their best row so the most-popular task appears
+        first. Then walk the groups round-robin, popping one row from each
+        non-empty group per pass, until all groups are empty.
+        """
+        from collections import OrderedDict
+
+        def _interleave_bucket(bucket):
+            if not bucket:
+                return []
+            groups = OrderedDict()
+            for e in bucket:  # bucket is already sorted by popularity desc
+                groups.setdefault(e.get("task_type") or "Other", []).append(e)
+            out = []
+            while any(groups.values()):
+                for task, queue in list(groups.items()):
+                    if queue:
+                        out.append(queue.pop(0))
+            return out
+
+        vllm = [e for e in entries if e.get("has_vllm")]
+        non_vllm = [e for e in entries if not e.get("has_vllm")]
+        return _interleave_bucket(vllm) + _interleave_bucket(non_vllm)
 
     for section in sections:
         try:
@@ -3725,6 +3925,17 @@ def update_readme(
             sections[section]["Kaggle"]["rows"].sort(key=_section_row_sort_key, reverse=True)
         except Exception as e:
             print(f"Warning: Could not sort Kaggle rows for section '{section}': {e}")
+
+    # Re-order the GRPO section by interleaving task types so adjacent rows
+    # show different tasks (GSM8K Math -> 2048 Game -> Sudoku -> ...). This
+    # only applies to "GRPO & Reinforcement Learning"; every other section
+    # stays in pure popularity order.
+    _grpo_section = "GRPO & Reinforcement Learning"
+    if _grpo_section in sections:
+        for platform in ("Colab", "Kaggle"):
+            sections[_grpo_section][platform]["rows"] = _interleave_by_task(
+                sections[_grpo_section][platform]["rows"]
+            )
 
     # Flatten row entries back into raw strings for the rendering step below.
     for section in sections:
