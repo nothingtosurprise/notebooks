@@ -29,12 +29,20 @@ import shutil
 import stat
 import subprocess
 import sys
+import csv
 import hashlib
-from datetime import datetime
+from datetime import datetime, timezone
 from glob import glob
 from nbconvert import PythonExporter
 import nbformat
 from spellchecker import SpellChecker
+
+try:
+    from huggingface_hub import HfApi
+    from huggingface_hub.errors import RepositoryNotFoundError
+except Exception:
+    HfApi = None
+    RepositoryNotFoundError = Exception
 
 try:
     from tqdm.auto import tqdm as _tqdm
@@ -805,6 +813,11 @@ _ALL_NB_FIXES = {
 
 ARCHITECTURE_MAPPING = {
     # Gemma Family
+    # NOTE: "gemma4" must appear before "gemma" so that the longest-key-first
+    # match in extract_model_info_refined routes Gemma 4 notebooks to their
+    # own section. Other Gemma* notebooks (Gemma3, Gemma3N, Gemma2,
+    # FunctionGemma, EmbeddingGemma, CodeGemma) still resolve to "Gemma".
+    "gemma4": "Gemma 4",
     "gemma": "Gemma",
     "codegemma": "Gemma", # Explicitly map specific models if needed
 
@@ -838,9 +851,10 @@ ARCHITECTURE_MAPPING = {
     # gpt oss
     "gpt oss": "GPT-OSS",
 
-    # Linear Attention
-    "falcon": "Linear Attention",
-    "liquid": "Linear Attention",
+    # Hybrid Attention (SSM / linear-attention hybrids, Mamba-style models)
+    "falcon": "Hybrid Attention",
+    "liquid": "Hybrid Attention",
+    "lfm": "Hybrid Attention",
 
     # Deepseek
     "deepseek": "Deepseek",
@@ -953,6 +967,18 @@ README_SKIP_NOTEBOOKS = [
     "Meta_Synthetic_Data_Llama3_2_(3B).ipynb"
 ]
 
+# Per-notebook overrides for the Model column in README.md tables. Keyed by
+# the on-disk basename (with .ipynb). The value is the literal Markdown text
+# rendered between the surrounding ** ** bold markers, so HTML tags such as
+# <br> can be embedded for multi-line cells. Only set this for notebooks
+# whose computed model name is too long to fit on a single README row.
+README_MODEL_NAME_OVERRIDES = {
+    "CodeForces-cot-Finetune_for_Reasoning_on_CodeForces.ipynb":
+        "CodeForces cot Finetune<br>for Reasoning on CodeForces",
+    "Kaggle-CodeForces-cot-Finetune_for_Reasoning_on_CodeForces.ipynb":
+        "CodeForces cot Finetune<br>for Reasoning on CodeForces",
+}
+
 
 FIRST_MAPPING_NAME = {
     "gpt-oss-(20B)-Fine-tuning.ipynb" : "gpt_oss_(20B)-Fine-tuning.ipynb",
@@ -974,6 +1000,15 @@ FIRST_MAPPING_NAME = {
     # Gemma
     "Gemma3_(4B).ipynb" : "Gemma3_(4B)-Conversational.ipynb",
     "Gemma3_(270M).ipynb" : "Gemma3_(270M)-Conversational.ipynb",
+    # Gemma 4 Text notebooks: the on-disk filenames use the "-Text" suffix
+    # which is not a known type, so the README row generator would render
+    # them with an empty Type column. Map them to "-Conversational" so the
+    # type extractor picks "Conversational" (matching how Gemma 3 Text
+    # notebooks are labelled).
+    "Gemma4_(E2B)-Text.ipynb" : "Gemma4_(E2B)-Conversational.ipynb",
+    "Gemma4_(E4B)-Text.ipynb" : "Gemma4_(E4B)-Conversational.ipynb",
+    "Gemma4_(31B)-Text.ipynb" : "Gemma4_(31B)-Conversational.ipynb",
+    "Gemma4_(26B_A4B)-Text.ipynb" : "Gemma4_(26B_A4B)-Conversational.ipynb",
 
     # Granite
     "Granite4.0_350M.ipynb" : "Granite4.0_(350M)-Conversational.ipynb",
@@ -2070,16 +2105,34 @@ def extract_version_from_row(row):
         return (0, 0)
 
 def extract_version(model_name):
-    """Extracts the version number for sorting.
+    """Extracts the architecture version number for sorting.
 
     Handles cases like:
         - Phi 3 Medium
         - Phi 3.5 Mini
         - Phi 4
+        - Gemma4 (E4B)        -> 4 (size E4B is ignored)
+        - (A100) Gemma3 (27B) -> 3 (A100 prefix and 27B size are ignored)
+        - Llama3.1 (8B)       -> (3, 1)
     Returns a tuple of (major version, minor version) for proper sorting.
-    Returns (0, 0) if no version is found.
+    Returns (0, 0) if no version is found in the architecture name.
+
+    The size suffix (e.g. "**(7B)**", "**(E4B)**") and the "(A100)" prefix
+    are stripped before searching for the version digit, otherwise the
+    parameter count or "100" from "A100" would be picked up as the version.
     """
-    match = re.search(r"(\d+(\.\d+)?)", model_name)
+    name = model_name
+    # Strip a trailing parenthesised size suffix wrapped in markdown bold,
+    # e.g. "**Gemma4** **(E4B)**" -> "**Gemma4** "
+    name = re.sub(r"\*\*\([^)]*\)\*\*\s*$", "", name).strip()
+    # Strip a trailing parenthesised size suffix without bold,
+    # e.g. "Gemma4 (E4B)" -> "Gemma4"
+    name = re.sub(r"\([^)]*\)\s*$", "", name).strip()
+    # Strip an "(A100)" or "(A100) " prefix anywhere
+    name = re.sub(r"\(A100\)\s*", "", name).strip()
+    # Strip markdown bold markers
+    name = name.replace("**", "").strip()
+    match = re.search(r"(\d+(\.\d+)?)", name)
     if match:
         version_str = match.group(1)
         if "." in version_str:
@@ -2089,6 +2142,553 @@ def extract_version(model_name):
             return (int(version_str), 0)
     else:
         return (0, 0)
+
+
+# ============================================================================
+# Model reference extraction + created_at cache (for README sorting)
+# ============================================================================
+#
+# The README row order within each section is computed from the HF Hub
+# popularity (downloads + likes*1000) of the models each notebook actually
+# loads. To avoid hitting the Hub on every run we maintain a CSV at
+#   scripts/model_created_at.csv
+# which maps <org>/<repo> to its created_at, downloads, likes, fetched_at
+# and status. Entries that cannot be resolved (datasets, 404s, placeholders
+# that escaped the blocklist) are cached with status=not_found so we do not
+# re-query them. ok rows older than _MODEL_CACHE_OK_TTL_DAYS days get
+# refreshed automatically since downloads/likes drift over time.
+
+# <org>/<repo> where both pieces look like HF repo IDs. Anchored by one of:
+# start-of-string, whitespace, quote, open-paren, open-bracket, open-brace,
+# comma, colon, equals. Ends at a similar boundary.
+_HF_MODEL_REF_RE = re.compile(
+    r"""(?P<before>^|['"\s\(\[\{,:=])
+        (?P<org>[A-Za-z][A-Za-z0-9._-]{0,95})
+        /
+        (?P<repo>[A-Za-z0-9][A-Za-z0-9._-]{0,95})
+        (?=['"\s\)\]\},:]|$)
+    """,
+    re.VERBOSE,
+)
+
+# Matches the primary model assignment: model_name = "org/repo" (or single-quoted).
+# This is the model the notebook actually loads. Many notebooks also list
+# alternative models in a `gemma4_models = [...]` style block; those show up
+# in the generic ref set but are not what the notebook trains on, so we
+# prefer assignments for sorting.
+_HF_MODEL_NAME_ASSIGN_RE = re.compile(
+    r"""model_name\s*=\s*(?P<quote>['"])
+        (?P<org>[A-Za-z][A-Za-z0-9._-]{0,95})
+        /
+        (?P<repo>[A-Za-z0-9][A-Za-z0-9._-]{0,95})
+        (?P=quote)
+    """,
+    re.VERBOSE,
+)
+
+# Matches a positional repo passed as the first arg of .from_pretrained(...).
+# Example: FastVisionModel.from_pretrained("unsloth/gemma-4-E4B-it", ...)
+# This is used when the notebook author omits the model_name= keyword.
+_HF_FROM_PRETRAINED_POSITIONAL_RE = re.compile(
+    r"""\.from_pretrained\s*\(\s*(?P<quote>['"])
+        (?P<org>[A-Za-z][A-Za-z0-9._-]{0,95})
+        /
+        (?P<repo>[A-Za-z0-9][A-Za-z0-9._-]{0,95})
+        (?P=quote)
+    """,
+    re.VERBOSE,
+)
+
+# Strings that look like <org>/<repo> in the notebook source but are never
+# real Hugging Face repos. These get filtered at extraction time so we do
+# not pollute the cache with thousands of useless rows.
+_HF_MODEL_REF_PLACEHOLDER_ORGS = {
+    # Placeholders users are supposed to edit before running
+    "HF_USERNAME", "HF_ACCOUNT", "YOUR_USERNAME", "your_name",
+    "hf", "HuggingFaceOrganization", "HuggingFaceUser",
+    # Python variable names that happen to collide
+    "repo_id", "prompt",
+    # Local save paths used in post-training snippets
+    "grpo_lora", "grpo_saved_lora",
+    # Comment fragments
+    "TrackIO",   # "# Use TrackIO/WandB etc"
+    "data",      # file path fragments
+    "python",    # e.g. "python/triton_kernels"
+    "Colab",
+    "pros",
+}
+
+# Cache file relative to the repo root.
+_MODEL_CREATED_CACHE_PATH = os.path.join("scripts", "model_created_at.csv")
+
+
+def extract_hf_model_refs_from_notebook(notebook_path):
+    """Scan a notebook's code cells for <org>/<repo> Hugging Face model refs.
+
+    Returns (all_refs, assigned_refs):
+        all_refs      : set of every "org/repo" string found in the code cells.
+        assigned_refs : ordered list (deduped, insertion order) of the values
+                        assigned to `model_name = "..."`. These are the models
+                        the notebook actually loads and should take precedence
+                        in the sort key.
+
+    Placeholders (HF_USERNAME, etc.), URL path fragments, and anything that
+    looks like a local file path are filtered out. Returns (set(), []) on
+    I/O or parse errors.
+    """
+    try:
+        with open(notebook_path, "r", encoding="utf-8") as f:
+            nb = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return set(), []
+
+    refs = set()
+    assigned = []  # preserve order, first assignment wins ties
+    seen_assigned = set()
+    for cell in nb.get("cells", []):
+        if cell.get("cell_type") != "code":
+            continue
+        src_list = cell.get("source", [])
+        if isinstance(src_list, str):
+            src = src_list
+        else:
+            src = "".join(src_list)
+
+        # Pull out the primary model loads first: model_name="..." assignments
+        # and positional first-arg .from_pretrained("...") calls. These are
+        # what the notebook actually loads. We still add them to the generic
+        # refs set below.
+        for primary_re in (_HF_MODEL_NAME_ASSIGN_RE, _HF_FROM_PRETRAINED_POSITIONAL_RE):
+            for m in primary_re.finditer(src):
+                org = m.group("org")
+                repo = m.group("repo")
+                if "." in org or org in _HF_MODEL_REF_PLACEHOLDER_ORGS:
+                    continue
+                ref = f"{org}/{repo}"
+                if ref not in seen_assigned:
+                    assigned.append(ref)
+                    seen_assigned.add(ref)
+
+        for m in _HF_MODEL_REF_RE.finditer(src):
+            org = m.group("org")
+            repo = m.group("repo")
+            # Skip URLs (match preceded by "://")
+            start = m.start("org")
+            if start >= 3 and src[start - 3:start] == "://":
+                continue
+            # Orgs containing a dot are always domain-ish, never HF orgs
+            if "." in org:
+                continue
+            if org in _HF_MODEL_REF_PLACEHOLDER_ORGS:
+                continue
+            refs.add(f"{org}/{repo}")
+    return refs, assigned
+
+
+def _load_model_created_cache(cache_path=_MODEL_CREATED_CACHE_PATH):
+    """Load the model popularity CSV into a dict keyed by model_repo.
+
+    Each value is a dict with keys:
+        created_at : str (ISO 8601 UTC) or ""
+        downloads  : int (0 if missing/unknown)
+        likes      : int (0 if missing/unknown)
+        base_model : str (single upstream repo) or ""
+        fetched_at : str (ISO 8601 UTC)
+        status     : "ok" | "not_found" | "error"
+
+    Older CSV files without one or more of these columns are still supported:
+    missing numeric columns default to 0 and missing string columns to "".
+
+    Returns an empty dict if the file is missing or unreadable.
+    """
+    cache = {}
+    if not os.path.exists(cache_path):
+        return cache
+    try:
+        with open(cache_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                repo = (row.get("model_repo") or "").strip()
+                if not repo:
+                    continue
+                def _to_int(v):
+                    try:
+                        return int((v or "").strip() or 0)
+                    except (TypeError, ValueError):
+                        return 0
+                cache[repo] = {
+                    "created_at": (row.get("created_at") or "").strip(),
+                    "downloads": _to_int(row.get("downloads")),
+                    "likes": _to_int(row.get("likes")),
+                    "base_model": (row.get("base_model") or "").strip(),
+                    "fetched_at": (row.get("fetched_at") or "").strip(),
+                    "status": (row.get("status") or "").strip() or "ok",
+                }
+    except Exception as e:
+        print(f"  [WARN] Could not parse {cache_path}: {e}")
+    return cache
+
+
+def _write_model_created_cache(cache, cache_path=_MODEL_CREATED_CACHE_PATH):
+    """Write the cache dict out as CSV, sorted alphabetically for stable diffs."""
+    os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+    with open(cache_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "model_repo", "created_at", "downloads", "likes",
+            "base_model", "fetched_at", "status",
+        ])
+        for repo in sorted(cache.keys()):
+            entry = cache[repo]
+            writer.writerow([
+                repo,
+                entry.get("created_at", ""),
+                entry.get("downloads", 0),
+                entry.get("likes", 0),
+                entry.get("base_model", ""),
+                entry.get("fetched_at", ""),
+                entry.get("status", ""),
+            ])
+
+
+def _extract_base_model(info):
+    """Pull a single upstream repo from model_info card_data.base_model.
+
+    The HF card field can be:
+      * a string ("Qwen/Qwen2.5-VL-7B-Instruct")
+      * a list of strings (["Qwen/Qwen2.5-VL-7B-Instruct"])
+      * missing entirely
+    We return the first valid <org>/<repo> we find, or "" if none.
+    """
+    cd = getattr(info, "card_data", None)
+    if cd is None:
+        return ""
+    base = getattr(cd, "base_model", None)
+    if base is None and isinstance(cd, dict):
+        base = cd.get("base_model")
+    if not base:
+        return ""
+    if isinstance(base, str):
+        candidates = [base]
+    elif isinstance(base, (list, tuple)):
+        candidates = [b for b in base if isinstance(b, str)]
+    else:
+        return ""
+    for c in candidates:
+        c = c.strip()
+        if "/" in c and c.count("/") == 1:
+            org, repo = c.split("/", 1)
+            if org and repo and "." not in org:
+                return c
+    return ""
+
+
+def _fetch_model_info(repo):
+    """Query HF Hub for model popularity.
+
+    Returns (created_at, downloads, likes, base_model, status). status in
+    {"ok", "not_found", "error"}. On non-ok, numeric fields are 0 and
+    string fields are "".
+
+    Uses HF_TOKEN from the environment when present so that gated/private
+    repos resolve instead of bouncing as 404s.
+    """
+    if HfApi is None:
+        return ("", 0, 0, "", "error")
+    try:
+        token = os.environ.get("HF_TOKEN") or None
+        api = HfApi(token=token)
+        info = api.model_info(repo, timeout=15, token=token)
+    except RepositoryNotFoundError:
+        return ("", 0, 0, "", "not_found")
+    except Exception:
+        return ("", 0, 0, "", "error")
+
+    created_at = getattr(info, "created_at", None)
+    if created_at is None:
+        created_at_str = ""
+    elif hasattr(created_at, "astimezone"):
+        try:
+            created_at_str = created_at.astimezone(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+        except Exception:
+            created_at_str = str(created_at)
+    else:
+        created_at_str = str(created_at)
+
+    def _safe_int(v):
+        try:
+            return int(v) if v is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    downloads = _safe_int(getattr(info, "downloads", 0))
+    likes = _safe_int(getattr(info, "likes", 0))
+    base_model = _extract_base_model(info)
+    return (created_at_str, downloads, likes, base_model, "ok")
+
+
+# How long an "ok" row is allowed to stay in the cache before its
+# downloads/likes are refreshed against the Hub. created_at is immutable so
+# this only matters for the popularity counters.
+_MODEL_CACHE_OK_TTL_DAYS = 14
+
+
+def _ok_row_is_stale(entry, ttl_days=_MODEL_CACHE_OK_TTL_DAYS):
+    """Return True if an ok-status cache row is older than ttl_days.
+
+    Rows that are missing fetched_at or have an unparseable timestamp are
+    considered stale so they get refreshed on the next run.
+    """
+    fetched_at = _parse_iso8601_utc(entry.get("fetched_at"))
+    if fetched_at is None:
+        return True
+    age = datetime.now(timezone.utc) - fetched_at
+    return age.total_seconds() > ttl_days * 86400
+
+
+def refresh_model_created_cache(notebook_paths, cache_path=_MODEL_CREATED_CACHE_PATH):
+    """Scan notebooks, populate/refresh the cache, and return (cache, refs_by_nb, assigned_by_nb).
+
+    refs_by_nb     : dict[notebook_path, set[model_repo]]
+    assigned_by_nb : dict[notebook_path, list[model_repo]]  # model_name="..." hits
+    cache          : dict[model_repo, {"created_at", "downloads", "likes", "fetched_at", "status"}]
+
+    Refresh policy:
+      * Repos not in the cache: always fetched.
+      * Status "error": always re-fetched (transient failures retry).
+      * Status "ok" and fetched_at older than _MODEL_CACHE_OK_TTL_DAYS days:
+        re-fetched so downloads/likes stay reasonably current.
+      * Status "ok" within the TTL window: skipped (cheap no-op runs).
+      * Status "not_found": sticky, never re-queried.
+    """
+    cache = _load_model_created_cache(cache_path)
+
+    refs_by_nb = {}
+    assigned_by_nb = {}
+    all_refs = set()
+    for path in notebook_paths:
+        refs, assigned = extract_hf_model_refs_from_notebook(path)
+        refs_by_nb[path] = refs
+        assigned_by_nb[path] = assigned
+        all_refs.update(refs)
+
+    # Decide which repos still need a fetch
+    to_fetch = []
+    for repo in sorted(all_refs):
+        entry = cache.get(repo)
+        if entry is None:
+            to_fetch.append(repo)
+            continue
+        status = entry.get("status")
+        if status == "error":
+            to_fetch.append(repo)
+        elif status == "ok" and _ok_row_is_stale(entry):
+            to_fetch.append(repo)
+        # status == "not_found": skip
+        # status == "ok" and fresh: skip
+
+    def _do_fetch_pass(repos, label):
+        if not repos:
+            return
+        print(f"  Fetching popularity for {len(repos)} {label} repo(s) from HF Hub...")
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ok = not_found = errors = 0
+        for i, repo in enumerate(repos, 1):
+            created_at, downloads, likes, base_model, status = _fetch_model_info(repo)
+            # Preserve the existing created_at/base_model if the new fetch
+            # lost them but we had them before (defensive: card_data can
+            # disappear or fail to parse on individual fetches).
+            prev = cache.get(repo) or {}
+            if not created_at and prev.get("created_at"):
+                created_at = prev["created_at"]
+            if not base_model and prev.get("base_model"):
+                base_model = prev["base_model"]
+            cache[repo] = {
+                "created_at": created_at,
+                "downloads": downloads,
+                "likes": likes,
+                "base_model": base_model,
+                "fetched_at": now_iso,
+                "status": status,
+            }
+            if status == "ok":
+                ok += 1
+            elif status == "not_found":
+                not_found += 1
+            else:
+                errors += 1
+            if i % 25 == 0 or i == len(repos):
+                print(
+                    f"    {i}/{len(repos)} "
+                    f"(ok={ok} not_found={not_found} errors={errors})"
+                )
+
+    if to_fetch:
+        _do_fetch_pass(to_fetch, "notebook-referenced")
+    else:
+        print("  Notebook-referenced popularity cache is up to date.")
+
+    # Second pass: any base_model upstream we discovered that isn't already
+    # in the cache. This pulls in upstream repos like Qwen/Qwen2.5-VL-7B-Instruct
+    # that the notebooks themselves never reference but that drive the real
+    # popularity of the model family.
+    base_to_fetch = []
+    seen_base = set()
+    for repo, entry in cache.items():
+        if entry.get("status") != "ok":
+            continue
+        bm = (entry.get("base_model") or "").strip()
+        if not bm or bm in seen_base or bm in cache:
+            continue
+        seen_base.add(bm)
+        base_to_fetch.append(bm)
+    base_to_fetch.sort()
+    if base_to_fetch:
+        _do_fetch_pass(base_to_fetch, "upstream base_model")
+
+    if to_fetch or base_to_fetch:
+        _write_model_created_cache(cache, cache_path)
+
+    return cache, refs_by_nb, assigned_by_nb
+
+
+# Each like is worth this many downloads in the popularity score. Likes are
+# rare relative to downloads (a popular model has thousands of downloads but
+# usually <100 likes), so the multiplier is what makes them actually move
+# the ordering.
+_LIKE_WEIGHT = 1000
+
+# Freshness boost to counteract the cold-start problem: a brand-new model
+# has 0 downloads but should still appear high in the README for its first
+# few weeks so readers can find it. The boost is added on top of the raw
+# downloads+likes score, linearly decaying from _NEW_MODEL_BOOST_MAGNITUDE
+# at day 0 to 0 at day _NEW_MODEL_BOOST_WINDOW_DAYS. The magnitude is sized
+# to comfortably exceed the most popular Vision/Llama upstream scores
+# (~5-6M) so a day-0 release can land at the top of cross-cutting
+# sections like Vision (Multimodal).
+_NEW_MODEL_BOOST_WINDOW_DAYS = 30
+_NEW_MODEL_BOOST_MAGNITUDE = 15_000_000
+
+
+def _parse_iso8601_utc(s):
+    """Parse a stored ISO8601 string back into an aware UTC datetime.
+
+    Returns None on anything unparseable. Accepts both "...Z" and
+    "+00:00" suffixes (matching the two formats the cache can hold).
+    """
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            )
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _freshness_boost(entry):
+    """Decaying score boost for a recently-created model.
+
+    Returns 0 outside the boost window or when created_at is missing. The
+    boost scales linearly from _NEW_MODEL_BOOST_MAGNITUDE at age 0 to 0
+    at age _NEW_MODEL_BOOST_WINDOW_DAYS days.
+    """
+    if not entry:
+        return 0
+    dt = _parse_iso8601_utc(entry.get("created_at"))
+    if dt is None:
+        return 0
+    age_days = (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0
+    if age_days < 0 or age_days >= _NEW_MODEL_BOOST_WINDOW_DAYS:
+        return 0
+    decay = 1.0 - (age_days / _NEW_MODEL_BOOST_WINDOW_DAYS)
+    return int(_NEW_MODEL_BOOST_MAGNITUDE * decay)
+
+
+def _entry_self_score(entry):
+    """Popularity score for one cache entry: downloads + likes*1000 + freshness boost.
+
+    Returns 0 for missing/non-ok entries. Does NOT follow base_model.
+    """
+    if not entry or entry.get("status") != "ok":
+        return 0
+    downloads = entry.get("downloads", 0) or 0
+    likes = entry.get("likes", 0) or 0
+    return downloads + likes * _LIKE_WEIGHT + _freshness_boost(entry)
+
+
+def _popularity_score(entry, cache=None, _seen=None):
+    """Popularity score for a cache entry, following base_model upstream.
+
+    If the entry has a base_model that resolves to an ok cache row, the
+    returned score is the MAX of (this entry, the upstream entry's score).
+    This way notebooks that load `unsloth/X-bnb-4bit` inherit the popularity
+    of the canonical upstream `Qwen/X` (or whatever the base_model is).
+
+    Cycles are guarded by _seen.
+    """
+    if not entry or entry.get("status") != "ok":
+        return 0
+    score = _entry_self_score(entry)
+    if cache is None:
+        return score
+    bm = (entry.get("base_model") or "").strip()
+    if not bm:
+        return score
+    if _seen is None:
+        _seen = set()
+    if bm in _seen:
+        return score
+    _seen.add(bm)
+    upstream = cache.get(bm)
+    if upstream is None:
+        return score
+    return max(score, _popularity_score(upstream, cache, _seen))
+
+
+def notebook_created_at_key(notebook_path, refs_by_nb, cache, assigned_by_nb=None):
+    """Return the sort key for one notebook: (popularity_score, count_ok).
+
+    The name is kept for back-compat but the key is driven by HF Hub
+    popularity (downloads + likes*1000), with base_model upstream lookup.
+
+    Preference order for *which* model the score comes from:
+      1. If the notebook has one or more `model_name = "org/repo"` (or
+         positional `from_pretrained("...")`) loads that resolved to ok,
+         take the MAX score across THOSE (each follows its base_model).
+      2. Otherwise, fall back to the MAX score across every HF ref
+         discovered in the notebook.
+
+    count_ok is the number of resolved repos in the chosen pool, used as a
+    minor tiebreaker. Notebooks with no resolvable refs return (0, 0).
+    """
+    def _scores(repos):
+        out = []
+        for repo in repos:
+            entry = cache.get(repo)
+            if entry and entry.get("status") == "ok":
+                out.append(_popularity_score(entry, cache))
+        return out
+
+    if assigned_by_nb:
+        assigned = assigned_by_nb.get(notebook_path, [])
+        assigned_scores = _scores(assigned)
+        if assigned_scores:
+            return (max(assigned_scores), len(assigned_scores))
+
+    refs = refs_by_nb.get(notebook_path, set())
+    ref_scores = _scores(refs)
+    if not ref_scores:
+        return (0, 0)
+    return (max(ref_scores), len(ref_scores))
 
 
 def _update_news_only(notebook_path, new_announcement):
@@ -2894,6 +3494,14 @@ def update_readme(
     paths = glob(os.path.join(notebooks_dir, "*.ipynb"))
     paths = [x.replace("\\", "/") for x in paths]
 
+    # Scan notebooks for HF model refs and refresh the model_created_at cache
+    # so we can sort rows by the most recently created referenced model.
+    try:
+        model_created_cache, refs_by_nb, assigned_by_nb = refresh_model_created_cache(paths)
+    except Exception as e:
+        print(f"  [WARN] Could not refresh model created_at cache: {e}")
+        model_created_cache, refs_by_nb, assigned_by_nb = {}, {}, {}
+
     # Priority sections appear first in the README, in this order
     priority_sections = [
         "GRPO & Reinforcement Learning",
@@ -2911,10 +3519,24 @@ def update_readme(
         if arch not in list_models:
             list_models.append(arch)
 
+    # Place "Gemma 4" immediately before "Gemma" so the newer family appears
+    # above its predecessor instead of after it (default alphabetical sort
+    # would order "Gemma" before "Gemma 4" because "Gemma" is a prefix).
+    if "Gemma 4" in list_models and "Gemma" in list_models:
+        list_models.remove("Gemma 4")
+        list_models.insert(list_models.index("Gemma"), "Gemma 4")
+
     # Cross-cutting sections (notebooks can appear in multiple sections)
     for cross_section in ["Vision (Multimodal)", "Embedding", "OCR"]:
         if cross_section not in list_models:
             list_models.append(cross_section)
+
+    # "Text Completion / Continued Pretraining" collects notebooks whose
+    # primary purpose is base-model continued pretraining or raw text
+    # completion, sitting just before "Other" at the end of the README.
+    _TEXT_COMPLETION_SECTION = "Text Completion / Continued Pretraining"
+    if _TEXT_COMPLETION_SECTION not in list_models:
+        list_models.append(_TEXT_COMPLETION_SECTION)
 
     list_models.append('Other')
 
@@ -2963,8 +3585,14 @@ def update_readme(
             print(f"Error processing {notebook_name}: {e}")
             info = {'name': notebook_name.replace('.ipynb',''), 'size': None, 'type': 'Error', 'architecture': None, 'requires_a100': False} # Fallback
 
-        model_name = info['name'] if info and info['name'] else notebook_name.replace('.ipynb','') 
-        model_type = info['type'] if info and info['type'] else "" 
+        model_name = info['name'] if info and info['name'] else notebook_name.replace('.ipynb','')
+        # Apply per-notebook display-name override (keyed by on-disk basename)
+        # so notebooks with very long auto-derived names can wrap onto multiple
+        # lines in the rendered Markdown table.
+        on_disk_basename = os.path.basename(path)
+        if on_disk_basename in README_MODEL_NAME_OVERRIDES:
+            model_name = README_MODEL_NAME_OVERRIDES[on_disk_basename]
+        model_type = info['type'] if info and info['type'] else ""
         architecture = info['architecture'] if info else None
         size = info['size'] 
         size = size.replace(r"_", " ") if size else None 
@@ -2974,8 +3602,27 @@ def update_readme(
 
         # Primary section (architecture-based)
         section_name = "Other"
-        if model_type == 'GRPO':
+        # Force-route notebooks whose filename signals a GRPO / RL environment
+        # even though the classifier did not tag them with model_type='GRPO'.
+        # Examples: NeMo-Gym-Sudoku.ipynb, NeMo-Gym-Multi-Environment.ipynb.
+        basename_lower = os.path.basename(path).lower()
+        is_forced_grpo = any(
+            kw in basename_lower for kw in ["nemo-gym", "nemo_gym"]
+        )
+        # Force-route text completion / continued pretraining notebooks so
+        # they land in the dedicated section instead of the architecture one.
+        # We key off the classified type and the filename because some
+        # notebooks have type="" in the cache but a clear filename.
+        is_text_completion = (
+            model_type in ("Text Completion", "CPT")
+            or "text_completion" in basename_lower
+            or "-cpt" in basename_lower
+            or "_cpt" in basename_lower
+        )
+        if model_type == 'GRPO' or is_forced_grpo:
             section_name = 'GRPO & Reinforcement Learning'
+        elif is_text_completion:
+            section_name = _TEXT_COMPLETION_SECTION
         elif architecture and architecture in list_models:
             section_name = architecture
 
@@ -3012,16 +3659,21 @@ def update_readme(
             image_alt = "Open In Colab"
         link = f'<a href="{link_url}" target="_blank" rel="noopener noreferrer"><img src="{image_src}" alt="{image_alt}"></a>'
 
+        created_at_key = notebook_created_at_key(
+            path, refs_by_nb, model_created_cache, assigned_by_nb=assigned_by_nb
+        )
+
         notebook_data.append(
             {
                 "model": model_name,
                 "type": model_type,
                 "link": link,
                 "sections": sections_for_notebook,
-                "path": path, 
-                "architecture" : architecture, 
-                "size" : size, 
+                "path": path,
+                "architecture" : architecture,
+                "size" : size,
                 "requires_a100": requires_a100,
+                "created_at_key": created_at_key,
             }
         )
 
@@ -3043,18 +3695,44 @@ def update_readme(
         model_prefix = "(A100) " if data.get('requires_a100', False) else ""
         row = f"| **{model_prefix}{data['model']}** {data['size']} | {data['type']} | {data['link']} |\n"
         platform = "Kaggle" if "kaggle" in data['link'].lower() else "Colab"
+        # Each row carries the precomputed popularity key so that
+        # section-level sorting can use it as the primary sort key.
+        row_entry = {
+            "row": row,
+            "popularity_key": data.get("created_at_key", (0, 0)),
+        }
         for section_name in data["sections"]:
-            sections[section_name][platform]["rows"].append(row)
+            sections[section_name][platform]["rows"].append(row_entry)
+
+    def _section_row_sort_key(entry):
+        # Primary: HF Hub popularity score (downloads + likes*1000) of the
+        # model the notebook actually loads. Notebooks with no resolvable
+        # model get 0 which sorts below every real score in a descending
+        # sort.
+        # Secondary: count of ok-status refs that contributed to the score.
+        # Tertiary: the version-from-name fallback so Gemma 4 > Gemma 3
+        # when popularity ties (e.g. brand-new releases with 0 downloads).
+        # Quaternary: the row string itself for stable ordering.
+        popularity, count_ok = entry["popularity_key"]
+        return (popularity, count_ok, extract_version_from_row(entry["row"]), entry["row"])
 
     for section in sections:
         try:
-            sections[section]["Colab"]["rows"].sort(key=lambda x: (extract_version_from_row(x), x), reverse=True)
+            sections[section]["Colab"]["rows"].sort(key=_section_row_sort_key, reverse=True)
         except Exception as e:
-            print(f"Warning: Could not sort Colab rows for section '{section}' by version: {e}")
+            print(f"Warning: Could not sort Colab rows for section '{section}': {e}")
         try:
-            sections[section]["Kaggle"]["rows"].sort(key=lambda x: (extract_version_from_row(x), x), reverse=True)
+            sections[section]["Kaggle"]["rows"].sort(key=_section_row_sort_key, reverse=True)
         except Exception as e:
-            print(f"Warning: Could not sort Kaggle rows for section '{section}' by version: {e}")
+            print(f"Warning: Could not sort Kaggle rows for section '{section}': {e}")
+
+    # Flatten row entries back into raw strings for the rendering step below.
+    for section in sections:
+        for platform in ("Colab", "Kaggle"):
+            sections[section][platform]["rows"] = [
+                e["row"] if isinstance(e, dict) else e
+                for e in sections[section][platform]["rows"]
+            ]
 
     try:
         with open(readme_path, "r", encoding="utf-8", newline="") as f:
